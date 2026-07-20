@@ -23,14 +23,19 @@ import {
   AzureContainerAppsClient,
   type AzureContainerAppsConnectionSettings,
 } from './sandboxClient.js';
-import { getOrCreateSnapshot, type AzureContainerAppsSnapshotSettings } from './snapshotCache.js';
+import {
+  getOrCreateSnapshot,
+  snapshotCacheName,
+  type AzureContainerAppsSnapshotSettings,
+} from './snapshotCache.js';
 import { AzureContainerAppsSandboxSession } from './sandboxSession.js';
 
 const DEFAULT_POLLING_INTERVAL_MS = 1000;
 const DEFAULT_PROCESS_POLLING_INTERVAL_MS = 500;
 const DEFAULT_RESUME_TIMEOUT_MS = 60_000;
 const DEFAULT_SNAPSHOT_RESTORE_TIMEOUT_MS = 60_000;
-const SNAPSHOT_FORMAT_VERSION = 2;
+const SNAPSHOT_FORMAT_VERSION = 3;
+const LEGACY_SNAPSHOT_FORMAT_VERSION = 2;
 const CREATION_ATTEMPT_LABEL = 'ai-sdk.creation-attempt';
 
 export type AzureContainerAppsSandboxSource =
@@ -42,6 +47,36 @@ type SandboxRequestSettings = Omit<
   CreateSandboxRequest,
   'sourcesRef' | 'ports' | 'labels' | 'skipEgressProxy'
 >;
+
+type BeforeFirstCreateHook = (
+  session: Experimental_SandboxSession,
+  options: { abortSignal?: AbortSignal },
+) => Promise<void>;
+
+type BeforeFirstCreateSettings =
+  | {
+      beforeFirstCreate?: undefined;
+      beforeFirstCreateIdentity?: undefined;
+    }
+  | {
+      /**
+       * Provider hook awaited immediately before Harness `onFirstCreate` with the same restricted session and active abort signal.
+       * It runs only when that work executes; failures skip Harness setup and propagate.
+       */
+      beforeFirstCreate: BeforeFirstCreateHook;
+      /**
+       * Required non-empty identity paired with `beforeFirstCreate` and included in snapshot identity.
+       * Update it whenever the hook's commands, dependencies, versions, or behavior change; callback source is never used.
+       */
+      beforeFirstCreateIdentity: string;
+    };
+
+type SnapshotOperation = {
+  promise: Promise<string>;
+  abortController: AbortController;
+  waiters: Set<object>;
+  settled: boolean;
+};
 
 export type AzureContainerAppsSandboxSettings = AzureContainerAppsConnectionSettings & {
   /** Source used for fresh sandboxes. Defaults to the public `node-24` disk. */
@@ -64,15 +99,18 @@ export type AzureContainerAppsSandboxSettings = AzureContainerAppsConnectionSett
   processPollingIntervalMs?: number;
   /** Timeout while waiting for a sandbox state transition. Defaults to 60 seconds. */
   resumeTimeoutMs?: number;
-  /** Timeout while waiting for a new snapshot to become restorable. */
+  /** Timeout while waiting for a new snapshot to become restorable. Defaults to 60 seconds. */
   snapshotRestoreTimeoutMs?: number;
   /** Snapshot caching policy. Set to false to run bootstrap on every fresh sandbox. */
   snapshots?: false | AzureContainerAppsSnapshotSettings;
-  /** Namespace added to snapshot cache identities. */
+  /**
+   * Namespace added to snapshot cache identities. Defaults to `default` and must be set explicitly
+   * when using `snapshots.namespaceRetentionCount`.
+   */
   snapshotNamespace?: string;
   /** Receives credential-safe lifecycle and request diagnostics. Disabled by default. */
   diagnostics?: AzureContainerAppsDiagnosticLogger;
-};
+} & BeforeFirstCreateSettings;
 
 export function createAzureContainerAppsSandbox(
   settings: AzureContainerAppsSandboxSettings,
@@ -87,7 +125,7 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
   private readonly client: AzureContainerAppsClient;
   private readonly ports: AddPortRequest[];
   private readonly portDefaults: Omit<AddPortRequest, 'port'>;
-  private readonly snapshotPromises = new Map<string, Promise<string>>();
+  private readonly snapshotOperations = new Map<string, SnapshotOperation>();
 
   constructor(private readonly settings: AzureContainerAppsSandboxSettings) {
     const pollingIntervalMs = settings.pollingIntervalMs ?? DEFAULT_POLLING_INTERVAL_MS;
@@ -104,6 +142,23 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
       'snapshotRestoreTimeoutMs',
       settings.snapshotRestoreTimeoutMs ?? DEFAULT_SNAPSHOT_RESTORE_TIMEOUT_MS,
     );
+
+    if (
+      (settings.beforeFirstCreate == null) !== (settings.beforeFirstCreateIdentity == null) ||
+      settings.beforeFirstCreateIdentity?.trim() === ''
+    ) {
+      throw new Error(
+        'beforeFirstCreate and a non-empty beforeFirstCreateIdentity must be provided together.',
+      );
+    }
+
+    if (
+      settings.snapshots !== false &&
+      settings.snapshots?.namespaceRetentionCount != null &&
+      settings.snapshotNamespace == null
+    ) {
+      throw new Error('snapshots.namespaceRetentionCount requires an explicit snapshotNamespace.');
+    }
 
     if (settings.sandbox != null && 'skipEgressProxy' in settings.sandbox) {
       throw new Error(
@@ -134,7 +189,22 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
     options?.abortSignal?.throwIfAborted();
     const name = resourceName(SESSION_NAME_PREFIX, options?.sessionId ?? randomUUID());
     const creationAttempt = randomUUID();
-    const shouldBootstrap = options?.onFirstCreate != null;
+    const harnessOnFirstCreate = options?.onFirstCreate;
+    const beforeFirstCreate = this.settings.beforeFirstCreate;
+    const onFirstCreate =
+      harnessOnFirstCreate == null
+        ? undefined
+        : beforeFirstCreate == null
+          ? harnessOnFirstCreate
+          : async (
+              session: Experimental_SandboxSession,
+              callbackOptions: { abortSignal?: AbortSignal },
+            ) => {
+              await beforeFirstCreate(session, callbackOptions);
+              callbackOptions.abortSignal?.throwIfAborted();
+              await harnessOnFirstCreate(session, callbackOptions);
+            };
+    const shouldBootstrap = onFirstCreate != null;
     const shouldSnapshot =
       shouldBootstrap && options?.identity != null && this.settings.snapshots !== false;
 
@@ -147,7 +217,7 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
         });
         const snapshotId = await this.snapshotForIdentity(
           options.identity!,
-          options.onFirstCreate!,
+          onFirstCreate!,
           options.abortSignal,
         );
         emitDiagnostic(this.settings.diagnostics, 'snapshot.session.selected', {
@@ -173,7 +243,7 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
       const session = await this.toNetworkSession(sandbox, options?.abortSignal);
 
       if (shouldBootstrap && !shouldSnapshot) {
-        await options.onFirstCreate!(
+        await onFirstCreate!(
           session.restricted(),
           options?.abortSignal == null ? {} : { abortSignal: options.abortSignal },
         );
@@ -237,39 +307,96 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
     abortSignal?: AbortSignal,
   ): Promise<string> {
     const source = this.source();
-    const key = [
-      this.settings.snapshotNamespace ?? 'default',
+    const namespace = this.settings.snapshotNamespace ?? 'default';
+    const snapshotSettings =
+      this.settings.snapshots === false ? undefined : this.settings.snapshots;
+    const cacheIdentity = {
+      namespace,
       identity,
-      stableHash({
-        source,
-        sandbox: this.settings.sandbox,
-        format: SNAPSHOT_FORMAT_VERSION,
-      }),
-    ].join(':');
-    const name = resourceName(SNAPSHOT_NAME_PREFIX, key);
-    const existing = this.snapshotPromises.get(name);
+      source,
+      sandbox: this.settings.sandbox,
+      format: SNAPSHOT_FORMAT_VERSION,
+      ...(this.settings.beforeFirstCreateIdentity == null
+        ? {}
+        : { beforeFirstCreateIdentity: this.settings.beforeFirstCreateIdentity }),
+    };
+    const name = snapshotCacheName(namespace, cacheIdentity);
+    const legacyName =
+      this.settings.beforeFirstCreate == null && snapshotSettings?.namespaceRetentionCount == null
+        ? resourceName(
+            SNAPSHOT_NAME_PREFIX,
+            [
+              namespace,
+              identity,
+              stableHash({
+                source,
+                sandbox: this.settings.sandbox,
+                format: LEGACY_SNAPSHOT_FORMAT_VERSION,
+              }),
+            ].join(':'),
+          )
+        : undefined;
+    const existing = this.snapshotOperations.get(name);
 
-    if (existing != null) return raceWithAbort(existing, abortSignal);
+    if (existing != null && !existing.abortController.signal.aborted) {
+      return this.waitForSnapshot(existing, abortSignal);
+    }
 
+    const abortController = new AbortController();
     const promise = getOrCreateSnapshot({
       client: this.client,
       name,
-      sourceRequest: this.createRequest(resourceName('snapshot-source', key), source, randomUUID()),
-      settings: this.settings.snapshots === false ? {} : (this.settings.snapshots ?? {}),
+      ...(legacyName == null ? {} : { legacyName }),
+      ...(this.settings.snapshotNamespace == null
+        ? {}
+        : { namespace: this.settings.snapshotNamespace }),
+      sourceRequest: this.createRequest(
+        resourceName('snapshot-source', stableHash(cacheIdentity)),
+        source,
+        randomUUID(),
+      ),
+      settings: snapshotSettings ?? {},
       ...(this.settings.diagnostics == null ? {} : { diagnostics: this.settings.diagnostics }),
-      createSession: (sandbox) => this.toRestrictedSession(sandbox),
+      abortSignal: abortController.signal,
+      createSession: (sandbox) => this.toRestrictedSession(sandbox, abortController.signal),
       onFirstCreate,
     }).then(({ id }) => id);
-    this.snapshotPromises.set(name, promise);
+    const operation: SnapshotOperation = {
+      promise,
+      abortController,
+      waiters: new Set(),
+      settled: false,
+    };
+    this.snapshotOperations.set(name, operation);
     void promise
       .finally(() => {
-        if (this.snapshotPromises.get(name) === promise) {
-          this.snapshotPromises.delete(name);
+        operation.settled = true;
+
+        if (this.snapshotOperations.get(name) === operation) {
+          this.snapshotOperations.delete(name);
         }
       })
       .catch(() => undefined);
 
-    return raceWithAbort(promise, abortSignal);
+    return this.waitForSnapshot(operation, abortSignal);
+  }
+
+  private async waitForSnapshot(
+    operation: SnapshotOperation,
+    abortSignal?: AbortSignal,
+  ): Promise<string> {
+    const waiter = {};
+    operation.waiters.add(waiter);
+
+    try {
+      return await raceWithAbort(operation.promise, abortSignal);
+    } finally {
+      operation.waiters.delete(waiter);
+
+      if (operation.waiters.size === 0 && !operation.settled) {
+        operation.abortController.abort(abortSignal?.reason);
+      }
+    }
   }
 
   private async createFromSnapshotWithRetry(
@@ -402,11 +529,14 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
     });
   }
 
-  private async toRestrictedSession(sandbox: Sandbox): Promise<Experimental_SandboxSession> {
+  private async toRestrictedSession(
+    sandbox: Sandbox,
+    abortSignal?: AbortSignal,
+  ): Promise<Experimental_SandboxSession> {
     return new AzureContainerAppsSandboxSession(
       this.client,
       sandbox.id,
-      await this.resolveWorkingDirectory(sandbox),
+      await this.resolveWorkingDirectory(sandbox, abortSignal),
       this.settings.sessionEnvironment ?? {},
       this.settings.processPollingIntervalMs ?? DEFAULT_PROCESS_POLLING_INTERVAL_MS,
     );

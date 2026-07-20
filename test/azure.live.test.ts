@@ -15,6 +15,7 @@ describe.runIf(runLive)('Azure Container Apps live contract', () => {
       const region = requiredEnvironment('AZURE_REGION');
       const sessionId = `live-${randomUUID()}`;
       const port = 43_123;
+      const providerMarker = '/tmp/provider-bootstrap-marker';
       const provider = createAzureContainerAppsSandbox({
         subscriptionId,
         resourceGroup,
@@ -27,12 +28,29 @@ describe.runIf(runLive)('Azure Container Apps live contract', () => {
             autoDelete: { enabled: true, deleteIntervalSeconds: 1800 },
           },
         },
+        beforeFirstCreate: async (restricted, { abortSignal }) => {
+          await restricted.writeTextFile({
+            path: providerMarker,
+            content: 'provider-ready',
+            ...(abortSignal == null ? {} : { abortSignal }),
+          });
+        },
+        beforeFirstCreateIdentity: 'live-provider-bootstrap-v1',
       });
 
       const session = await provider.createSession({
         sessionId,
         identity: 'live-contract-v1',
         onFirstCreate: async (restricted, { abortSignal }) => {
+          const marker = await restricted.readTextFile({
+            path: providerMarker,
+            ...(abortSignal == null ? {} : { abortSignal }),
+          });
+
+          if (marker !== 'provider-ready') {
+            throw new Error('Provider bootstrap did not run before Harness bootstrap.');
+          }
+
           await restricted.writeTextFile({
             path: '/tmp/snapshot-marker',
             content: 'snapshot-ready',

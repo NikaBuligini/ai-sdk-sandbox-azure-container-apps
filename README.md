@@ -184,25 +184,32 @@ type AzureContainerAppsSandboxSource =
 
 Important `AzureContainerAppsSandboxSettings` fields are:
 
-| Setting                    | Purpose and default                                                                                                                                                |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `source`                   | Fresh-session source; public `node-24` disk by default.                                                                                                            |
-| `sandbox`                  | Native create options except `sourcesRef`, `ports`, and `labels`. Fresh non-snapshot resources default to `1000m` CPU, `2048Mi` memory, and an empty disk setting. |
-| `labels`                   | Labels added to created resources; the internal `name` label is reserved.                                                                                          |
-| `ports`                    | Numbers or Azure `AddPortRequest` objects exposed at creation.                                                                                                     |
-| `portDefaults`             | Defaults for numeric ports and ports added by `setPorts`.                                                                                                          |
-| `sessionEnvironment`       | Environment merged into each command without storing it on the Azure resource. Per-command `env` values take precedence.                                           |
-| `defaultWorkingDirectory`  | Fallback working directory; `/root` by default.                                                                                                                    |
-| `pollingIntervalMs`        | Azure long-running operation polling; 1000 ms by default.                                                                                                          |
-| `processPollingIntervalMs` | Process output and exit polling; 500 ms by default.                                                                                                                |
-| `resumeTimeoutMs`          | Resume state-transition timeout; 60 seconds by default.                                                                                                            |
-| `snapshotRestoreTimeoutMs` | Retry window for a new snapshot restore; 60 seconds by default.                                                                                                    |
-| `snapshots`                | Snapshot policy, or `false` to disable setup caching.                                                                                                              |
-| `snapshotNamespace`        | Extra namespace included in snapshot cache identities; `default` by default.                                                                                       |
-| `endpoint`                 | Optional service endpoint override; otherwise derived from `region`.                                                                                               |
-| `diagnostics`              | Credential-safe lifecycle and request event logger; disabled by default.                                                                                           |
+| Setting                             | Purpose and default                                                                                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `source`                            | Fresh-session source; public `node-24` disk by default.                                                                                                            |
+| `sandbox`                           | Native create options except `sourcesRef`, `ports`, and `labels`. Fresh non-snapshot resources default to `1000m` CPU, `2048Mi` memory, and an empty disk setting. |
+| `labels`                            | Labels added to created resources; the internal `name` label is reserved.                                                                                          |
+| `ports`                             | Numbers or Azure `AddPortRequest` objects exposed at creation.                                                                                                     |
+| `portDefaults`                      | Defaults for numeric ports and ports added by `setPorts`.                                                                                                          |
+| `sessionEnvironment`                | Environment merged into each command without storing it on the Azure resource. Per-command `env` values take precedence.                                           |
+| `defaultWorkingDirectory`           | Fallback working directory; `/root` by default.                                                                                                                    |
+| `pollingIntervalMs`                 | Azure long-running operation polling; 1000 ms by default.                                                                                                          |
+| `processPollingIntervalMs`          | Process output and exit polling; 500 ms by default.                                                                                                                |
+| `resumeTimeoutMs`                   | Resume state-transition timeout; 60 seconds by default.                                                                                                            |
+| `snapshotRestoreTimeoutMs`          | Retry window for a new snapshot restore; 60 seconds by default.                                                                                                    |
+| `beforeFirstCreate`                 | Provider bootstrap hook awaited immediately before Harness `onFirstCreate` when that work runs.                                                                    |
+| `beforeFirstCreateIdentity`         | Required non-empty identity paired with `beforeFirstCreate`; update it whenever provider bootstrap behavior changes.                                               |
+| `snapshots`                         | Snapshot policy, or `false` to disable setup caching.                                                                                                              |
+| `snapshotNamespace`                 | Namespace included in snapshot identities; `default` by default. Set it explicitly when using `snapshots.namespaceRetentionCount`.                                 |
+| `snapshots.maxAgeMs`                | Maximum reusable snapshot age; seven days by default.                                                                                                              |
+| `snapshots.retentionCount`          | Snapshots retained per identity; three by default.                                                                                                                 |
+| `snapshots.namespaceRetentionCount` | Snapshots retained across identities in one explicit `snapshotNamespace`; unset by default.                                                                        |
+| `snapshots.sourceCleanupTimeoutMs`  | Maximum time to await temporary source deletion; 60 seconds by default.                                                                                            |
+| `snapshots.strictCleanup`           | Make source and retention cleanup failures fail an otherwise successful creation; `false` by default.                                                              |
+| `endpoint`                          | Optional service endpoint override; otherwise derived from `region`.                                                                                               |
+| `diagnostics`                       | Credential-safe lifecycle and request event logger; disabled by default.                                                                                           |
 
-`AzureContainerAppsSnapshotSettings` supports `maxAgeMs` (seven days), `retentionCount` (three), and `strictCleanup` (`false`). Abort signals are supported by create, resume, command, and file operations where the Harness interfaces expose them.
+Abort signals are supported by create, resume, command, and file operations where the Harness interfaces expose them.
 
 To investigate live snapshot failures, log the built-in snapshot events:
 
@@ -221,28 +228,49 @@ Events include snapshot, cache, and restore status plus sanitized Azure problem 
 
 ---
 
-## Cache setup
+## Set up caching
 
-Provide both `identity` and `onFirstCreate` to cache bootstrap work in an Azure snapshot. The callback receives a restricted session and runs only when a reusable snapshot must be built.
+Provide both `identity` and Harness `onFirstCreate` to cache bootstrap work in an Azure snapshot. Configure the provider-level `beforeFirstCreate` hook together with its required `beforeFirstCreateIdentity` when setup must happen first.
 
 ```ts
+const sandboxProvider = createAzureContainerAppsSandbox({
+  // Connection settings...
+  beforeFirstCreate: async (sandbox, { abortSignal }) => {
+    await sandbox.run({
+      command: './scripts/prepare-runtime.sh',
+      ...(abortSignal == null ? {} : { abortSignal }),
+    });
+  },
+  beforeFirstCreateIdentity: 'runtime-bootstrap-v1',
+});
+
 const session = await sandboxProvider.createSession({
   sessionId: 'job-42',
   identity: 'node-tools-v2',
   onFirstCreate: async (sandbox, { abortSignal }) => {
     await sandbox.run({
-      command: 'npm install --global pnpm',
-      abortSignal,
+      command: './scripts/prepare-agent.sh',
+      ...(abortSignal == null ? {} : { abortSignal }),
     });
   },
 });
 ```
 
-The cache identity includes `snapshotNamespace`, `identity`, source, native `sandbox` settings, and an internal format version. It does not include callback code, ports, labels, or `sessionEnvironment`, so change `identity` when bootstrap inputs change.
+`beforeFirstCreate` receives the same restricted session and active abort signal as Harness `onFirstCreate`, and is awaited immediately before it. If the provider hook fails, Harness setup is skipped and the failure propagates.
 
-When `onFirstCreate` is present without `identity`, it runs on each newly created session and no snapshot is reused. Set `snapshots: false` to run it for every fresh session even when both fields are present.
+The provider hook runs only when Harness `onFirstCreate` is present and actually executes. It does not run for cache hits, resumed sessions, or calls without `onFirstCreate`; without `identity`, or with `snapshots: false`, both hooks run on every fresh session.
 
-Current snapshots are reused up to `maxAgeMs`, and older matching snapshots are trimmed to `retentionCount`. Cleanup failures are ignored unless `strictCleanup` is `true`.
+Snapshot identity includes `snapshotNamespace`, Harness `identity`, source, native `sandbox` settings, an internal format version, and `beforeFirstCreateIdentity` when configured. Callback source is never used, so bump `identity` when Harness bootstrap inputs change and bump `beforeFirstCreateIdentity` whenever provider hook commands, dependencies, versions, or behavior change.
+
+New snapshots use versioned, unambiguous names. Exact compatible legacy names can still be reused safely when provider hooks and namespace retention are not active.
+
+`snapshots.retentionCount` continues to apply per identity. Set `snapshots.namespaceRetentionCount` with an explicit `snapshotNamespace` to cap snapshots across identities in that namespace; the selected snapshot and snapshots five minutes old or younger are preserved.
+
+Leaving `namespaceRetentionCount` unset preserves the previous per-identity retention behavior.
+
+Temporary source deletion honors active cancellation and is bounded by `snapshots.sourceCleanupTimeoutMs`, which defaults to 60 seconds. Azure may complete deletion after local cancellation or timeout, and a ten-minute source auto-delete policy provides a backstop.
+
+Source cleanup failures or timeouts and retention cleanup failures are best effort by default. With `strictCleanup: true`, they fail an otherwise successful creation, while an original bootstrap failure always remains primary.
 
 ---
 

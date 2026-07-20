@@ -2,7 +2,9 @@ import type {
   CreateSandboxRequest,
   Sandbox,
   SandboxGroupClient,
+  Snapshot,
 } from '@azure/containerapps-sandbox';
+import type { Experimental_SandboxSession } from '@ai-sdk/provider-utils';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createAzureContainerAppsSandbox,
@@ -10,6 +12,12 @@ import {
 } from '../src/index.js';
 import { resumeAction } from '../src/azureContainerAppsSandbox.js';
 import { resourceName, stableHash } from '../src/internal/utils.js';
+import { snapshotCacheName } from '../src/snapshotCache.js';
+
+type BeforeFirstCreateHook = (
+  session: Experimental_SandboxSession,
+  options: { abortSignal?: AbortSignal },
+) => Promise<void>;
 
 function sandbox(overrides: Partial<Sandbox> = {}): Sandbox {
   return {
@@ -103,6 +111,451 @@ describe('AzureContainerAppsSandboxProvider', () => {
         sandbox: { skipEgressProxy: true },
       } as unknown as AzureContainerAppsSandboxSettings),
     ).toThrow(/skipEgressProxy/);
+  });
+
+  it.each([
+    {
+      beforeFirstCreate: vi.fn(async () => undefined),
+    },
+    {
+      beforeFirstCreateIdentity: 'provider-v1',
+    },
+    {
+      beforeFirstCreate: vi.fn(async () => undefined),
+      beforeFirstCreateIdentity: '   ',
+    },
+  ])('validates paired provider bootstrap settings at runtime', (bootstrapSettings) => {
+    expect(() =>
+      createAzureContainerAppsSandbox({
+        client: {} as SandboxGroupClient,
+        ...bootstrapSettings,
+      } as unknown as AzureContainerAppsSandboxSettings),
+    ).toThrow(
+      'beforeFirstCreate and a non-empty beforeFirstCreateIdentity must be provided together.',
+    );
+  });
+
+  it('requires an explicit namespace for namespace-wide retention', () => {
+    expect(() =>
+      createAzureContainerAppsSandbox({
+        client: {} as SandboxGroupClient,
+        snapshots: { namespaceRetentionCount: 3 },
+      }),
+    ).toThrow('snapshots.namespaceRetentionCount requires an explicit snapshotNamespace.');
+  });
+
+  it('composes the provider hook with direct Harness bootstrap', async () => {
+    const order: string[] = [];
+    const abortController = new AbortController();
+    const beforeFirstCreate = vi.fn<BeforeFirstCreateHook>(async () => {
+      order.push('provider');
+    });
+    const onFirstCreate = vi.fn<BeforeFirstCreateHook>(async () => {
+      order.push('harness');
+    });
+    const client = {
+      sandboxes: {
+        beginCreate: vi.fn(() => ({ pollUntilDone: async () => sandbox() })),
+        exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+      },
+    } as unknown as SandboxGroupClient;
+    const provider = createAzureContainerAppsSandbox({
+      client,
+      snapshots: false,
+      beforeFirstCreate,
+      beforeFirstCreateIdentity: 'provider-v1',
+    });
+
+    await provider.createSession({ abortSignal: abortController.signal, onFirstCreate });
+
+    expect(order).toEqual(['provider', 'harness']);
+    expect(beforeFirstCreate.mock.calls[0]?.[0]).toBe(onFirstCreate.mock.calls[0]?.[0]);
+    expect(beforeFirstCreate.mock.calls[0]?.[1]).toBe(onFirstCreate.mock.calls[0]?.[1]);
+    expect(beforeFirstCreate.mock.calls[0]?.[1].abortSignal).toBe(abortController.signal);
+  });
+
+  it('skips Harness bootstrap when cancellation follows provider hook resolution', async () => {
+    const abortController = new AbortController();
+    const reason = new Error('cancelled between bootstrap hooks');
+    let releaseProvider!: () => void;
+    let markProviderStarted!: () => void;
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    const beforeFirstCreate = vi.fn<BeforeFirstCreateHook>(() => {
+      markProviderStarted();
+      const completion = providerGate.then(() => undefined);
+      void completion.then(() => abortController.abort(reason));
+
+      return completion;
+    });
+    const onFirstCreate = vi.fn<BeforeFirstCreateHook>(async () => undefined);
+    const beginDelete = vi.fn(() => ({ pollUntilDone: async () => undefined }));
+    const client = {
+      sandboxes: {
+        beginCreate: vi.fn(() => ({ pollUntilDone: async () => sandbox() })),
+        beginDelete,
+        exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+      },
+    } as unknown as SandboxGroupClient;
+    const provider = createAzureContainerAppsSandbox({
+      client,
+      snapshots: false,
+      beforeFirstCreate,
+      beforeFirstCreateIdentity: 'provider-v1',
+    });
+
+    const creation = provider.createSession({
+      abortSignal: abortController.signal,
+      onFirstCreate,
+    });
+    await providerStarted;
+    releaseProvider();
+
+    await expect(creation).rejects.toBe(reason);
+    expect(beforeFirstCreate).toHaveBeenCalledOnce();
+    expect(onFirstCreate).not.toHaveBeenCalled();
+    expect(beginDelete).toHaveBeenCalledOnce();
+  });
+
+  it('awaits the provider hook before Harness while building a snapshot', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const source = sandbox({ id: 'snapshot-source' });
+      const restored = sandbox({ id: 'snapshot-restored' });
+      const snapshots: Snapshot[] = [];
+      const order: string[] = [];
+      let releaseProvider!: () => void;
+      let markProviderStarted!: () => void;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProvider = resolve;
+      });
+      const providerStarted = new Promise<void>((resolve) => {
+        markProviderStarted = resolve;
+      });
+      const beforeFirstCreate = vi.fn<
+        (
+          session: Experimental_SandboxSession,
+          options: { abortSignal?: AbortSignal },
+        ) => Promise<void>
+      >(async () => {
+        order.push('provider:start');
+        markProviderStarted();
+        await providerGate;
+        order.push('provider:end');
+      });
+      const onFirstCreate = vi.fn<
+        (
+          session: Experimental_SandboxSession,
+          options: { abortSignal?: AbortSignal },
+        ) => Promise<void>
+      >(async () => {
+        order.push('harness');
+      });
+      const beginDelete = vi.fn(() => ({ pollUntilDone: async () => undefined }));
+      const beginCreate = vi.fn((request: CreateSandboxRequest) => ({
+        pollUntilDone: async () => (request.sourcesRef?.snapshot == null ? source : restored),
+      }));
+      const client = {
+        snapshots: {
+          list: async function* () {
+            yield* snapshots;
+          },
+          get: vi.fn(async () => snapshots[0]),
+        },
+        sandboxes: {
+          beginCreate,
+          beginCreateSnapshot: vi.fn((_sandboxId: string, options: { name: string }) => ({
+            pollUntilDone: async () => {
+              const created: Snapshot = {
+                id: 'snapshot-1',
+                labels: { name: options.name },
+                status: 'Ready',
+                createdAtUtc: new Date().toISOString(),
+              };
+              snapshots.push(created);
+              return created;
+            },
+          })),
+          beginDelete,
+          exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+        },
+      } as unknown as SandboxGroupClient;
+      const abortController = new AbortController();
+      const provider = createAzureContainerAppsSandbox({
+        client,
+        pollingIntervalMs: 1,
+        beforeFirstCreate,
+        beforeFirstCreateIdentity: 'provider-v1',
+      });
+
+      const creation = provider.createSession({
+        identity: 'harness-v1',
+        abortSignal: abortController.signal,
+        onFirstCreate,
+      });
+      await providerStarted;
+
+      expect(onFirstCreate).not.toHaveBeenCalled();
+      expect(order).toEqual(['provider:start']);
+
+      const [providerSession, providerOptions] = beforeFirstCreate.mock.calls[0]!;
+      expect('stop' in providerSession).toBe(false);
+      expect(providerOptions.abortSignal).toBeDefined();
+      expect(providerOptions.abortSignal).not.toBe(abortController.signal);
+      expect(providerOptions.abortSignal?.aborted).toBe(false);
+
+      releaseProvider();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(creation).resolves.toBeDefined();
+
+      const [harnessSession, harnessOptions] = onFirstCreate.mock.calls[0]!;
+      expect(harnessSession).toBe(providerSession);
+      expect(harnessOptions).toBe(providerOptions);
+      expect(order).toEqual(['provider:start', 'provider:end', 'harness']);
+      expect(beginDelete).toHaveBeenCalledWith(
+        'snapshot-source',
+        expect.objectContaining({ updateIntervalInMs: 1 }),
+      );
+      expect(beginCreate.mock.calls[1]?.[0].sourcesRef).toEqual({
+        snapshot: { id: 'snapshot-1' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a shared snapshot build active when one same-identity waiter aborts', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const source = sandbox({ id: 'snapshot-source' });
+      const restored = sandbox({ id: 'snapshot-restored' });
+      const snapshots: Snapshot[] = [];
+      let releaseProvider!: () => void;
+      let markProviderStarted!: () => void;
+      let sharedSignal: AbortSignal | undefined;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProvider = resolve;
+      });
+      const providerStarted = new Promise<void>((resolve) => {
+        markProviderStarted = resolve;
+      });
+      const beforeFirstCreate = vi.fn<BeforeFirstCreateHook>(async (_session, options) => {
+        sharedSignal = options.abortSignal;
+        markProviderStarted();
+        await providerGate;
+      });
+      const onFirstCreate = vi.fn<BeforeFirstCreateHook>(async () => undefined);
+      const beginCreate = vi.fn((request: CreateSandboxRequest) => ({
+        pollUntilDone: async () => (request.sourcesRef?.snapshot == null ? source : restored),
+      }));
+      const client = {
+        snapshots: {
+          list: async function* () {
+            yield* snapshots;
+          },
+          get: vi.fn(async () => snapshots[0]),
+        },
+        sandboxes: {
+          beginCreate,
+          beginCreateSnapshot: vi.fn((_sandboxId: string, options: { name: string }) => ({
+            pollUntilDone: async () => {
+              const created: Snapshot = {
+                id: 'snapshot-shared',
+                labels: { name: options.name },
+                status: 'Ready',
+                createdAtUtc: new Date().toISOString(),
+              };
+              snapshots.push(created);
+              return created;
+            },
+          })),
+          beginDelete: vi.fn(() => ({ pollUntilDone: async () => undefined })),
+          exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+        },
+      } as unknown as SandboxGroupClient;
+      const firstController = new AbortController();
+      const secondController = new AbortController();
+      const reason = new Error('first waiter cancelled');
+      const provider = createAzureContainerAppsSandbox({
+        client,
+        pollingIntervalMs: 1,
+        beforeFirstCreate,
+        beforeFirstCreateIdentity: 'provider-v1',
+      });
+
+      const first = provider.createSession({
+        sessionId: 'first-waiter',
+        identity: 'shared-identity',
+        abortSignal: firstController.signal,
+        onFirstCreate,
+      });
+      await providerStarted;
+      const second = provider.createSession({
+        sessionId: 'second-waiter',
+        identity: 'shared-identity',
+        abortSignal: secondController.signal,
+        onFirstCreate,
+      });
+
+      firstController.abort(reason);
+      await expect(first).rejects.toBe(reason);
+      expect(sharedSignal).toBeDefined();
+      expect(sharedSignal).not.toBe(firstController.signal);
+      expect(sharedSignal).not.toBe(secondController.signal);
+      expect(sharedSignal?.aborted).toBe(false);
+
+      releaseProvider();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(second).resolves.toBeDefined();
+      expect(beforeFirstCreate).toHaveBeenCalledOnce();
+      expect(onFirstCreate).toHaveBeenCalledOnce();
+      expect(beginCreate).toHaveBeenCalledTimes(2);
+      expect(beginCreate.mock.calls[1]?.[0].sourcesRef).toEqual({
+        snapshot: { id: 'snapshot-shared' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('propagates provider hook failure, skips Harness, and cleans up the snapshot source', async () => {
+    const failure = new Error('provider bootstrap failed');
+    const beforeFirstCreate = vi.fn(async () => Promise.reject(failure));
+    const onFirstCreate = vi.fn(async () => undefined);
+    const pollDelete = vi.fn(async () => undefined);
+    const beginDelete = vi.fn(() => ({ pollUntilDone: pollDelete }));
+    const beginCreateSnapshot = vi.fn();
+    const client = {
+      snapshots: {
+        list: async function* () {},
+      },
+      sandboxes: {
+        beginCreate: vi.fn(() => ({
+          pollUntilDone: async () => sandbox({ id: 'snapshot-source' }),
+        })),
+        beginCreateSnapshot,
+        beginDelete,
+        exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+      },
+    } as unknown as SandboxGroupClient;
+    const provider = createAzureContainerAppsSandbox({
+      client,
+      beforeFirstCreate,
+      beforeFirstCreateIdentity: 'provider-v1',
+    });
+
+    await expect(provider.createSession({ identity: 'harness-v1', onFirstCreate })).rejects.toBe(
+      failure,
+    );
+    expect(onFirstCreate).not.toHaveBeenCalled();
+    expect(beginCreateSnapshot).not.toHaveBeenCalled();
+    expect(beginDelete).toHaveBeenCalledWith(
+      'snapshot-source',
+      expect.objectContaining({ updateIntervalInMs: 1000 }),
+    );
+    expect(pollDelete).toHaveBeenCalledWith(
+      expect.objectContaining({ abortSignal: expect.anything() }),
+    );
+  });
+
+  it('does not run the provider hook without Harness onFirstCreate', async () => {
+    const beforeFirstCreate = vi.fn(async () => undefined);
+    const listSnapshots = vi.fn(async function* () {});
+    const beginCreate = vi.fn(() => ({ pollUntilDone: async () => sandbox() }));
+    const client = {
+      snapshots: { list: listSnapshots },
+      sandboxes: {
+        beginCreate,
+        exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+      },
+    } as unknown as SandboxGroupClient;
+    const provider = createAzureContainerAppsSandbox({
+      client,
+      beforeFirstCreate,
+      beforeFirstCreateIdentity: 'provider-v1',
+    });
+
+    await expect(provider.createSession({ identity: 'harness-v1' })).resolves.toBeDefined();
+    expect(beforeFirstCreate).not.toHaveBeenCalled();
+    expect(listSnapshots).not.toHaveBeenCalled();
+    expect(beginCreate).toHaveBeenCalledOnce();
+  });
+
+  it('keys snapshots by provider hook identity rather than callback source', async () => {
+    const nameFor = (beforeFirstCreateIdentity: string) =>
+      snapshotCacheName('default', {
+        namespace: 'default',
+        identity: 'harness-v1',
+        source: { type: 'public-disk', name: 'node-24' },
+        sandbox: undefined,
+        format: 3,
+        beforeFirstCreateIdentity,
+      });
+    const snapshots: Snapshot[] = [
+      {
+        id: 'snapshot-provider-v1',
+        labels: { name: nameFor('provider-v1') },
+        status: 'Ready',
+        createdAtUtc: new Date().toISOString(),
+      },
+      {
+        id: 'snapshot-provider-v2',
+        labels: { name: nameFor('provider-v2') },
+        status: 'Ready',
+        createdAtUtc: new Date().toISOString(),
+      },
+    ];
+    const beginCreate = vi.fn((request: CreateSandboxRequest) => ({
+      pollUntilDone: async () => sandbox({ id: request.sourcesRef?.snapshot?.id ?? 'unexpected' }),
+    }));
+    const client = {
+      snapshots: {
+        list: async function* () {
+          yield* snapshots;
+        },
+      },
+      sandboxes: {
+        beginCreate,
+        exec: vi.fn(async () => ({ exitCode: 0, stdout: '/root\n', stderr: '' })),
+      },
+    } as unknown as SandboxGroupClient;
+    const firstCallback = vi.fn(async () => undefined);
+    const differentCallbackSource = vi.fn(async () => {
+      return undefined;
+    });
+    const harnessOnFirstCreate = vi.fn(async () => undefined);
+
+    for (const [beforeFirstCreate, beforeFirstCreateIdentity] of [
+      [firstCallback, 'provider-v1'],
+      [differentCallbackSource, 'provider-v1'],
+      [differentCallbackSource, 'provider-v2'],
+    ] as const) {
+      const provider = createAzureContainerAppsSandbox({
+        client,
+        beforeFirstCreate,
+        beforeFirstCreateIdentity,
+      });
+      await provider.createSession({
+        identity: 'harness-v1',
+        onFirstCreate: harnessOnFirstCreate,
+      });
+    }
+
+    expect(beginCreate.mock.calls.map(([request]) => request.sourcesRef?.snapshot?.id)).toEqual([
+      'snapshot-provider-v1',
+      'snapshot-provider-v1',
+      'snapshot-provider-v2',
+    ]);
+    expect(firstCallback).not.toHaveBeenCalled();
+    expect(differentCallbackSource).not.toHaveBeenCalled();
+    expect(harnessOnFirstCreate).not.toHaveBeenCalled();
   });
 
   it('deletes a sandbox when post-create preparation fails', async () => {
@@ -274,7 +727,7 @@ describe('AzureContainerAppsSandboxProvider', () => {
       client,
       diagnostics,
       pollingIntervalMs: 1,
-      snapshotRestoreTimeoutMs: 1,
+      snapshotRestoreTimeoutMs: 60_000,
     });
 
     let failure: unknown;
