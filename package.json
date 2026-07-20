@@ -36,8 +36,7 @@
     }
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "scripts": {
     "build": "pnpm clean && tsc -p tsconfig.build.json",
