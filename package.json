@@ -1,0 +1,75 @@
+{
+  "name": "ai-sdk-sandbox-azure-container-apps",
+  "version": "0.1.0",
+  "description": "AI SDK Harness sandbox provider for Azure Container Apps Sandboxes",
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "azure",
+    "azure-container-apps",
+    "sandbox"
+  ],
+  "homepage": "https://github.com/NikaBuligini/ai-sdk-sandbox-azure-container-apps#readme",
+  "bugs": {
+    "url": "https://github.com/NikaBuligini/ai-sdk-sandbox-azure-container-apps/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NikaBuligini/ai-sdk-sandbox-azure-container-apps.git"
+  },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./build/index.js",
+  "types": "./build/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./build/index.d.ts",
+      "import": "./build/index.js",
+      "default": "./build/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "pnpm clean && tsc -p tsconfig.build.json",
+    "changeset": "changeset",
+    "clean": "node -e \"require('node:fs').rmSync('build', { recursive: true, force: true })\"",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint src test",
+    "release": "pnpm verify && changeset publish",
+    "test": "vitest run",
+    "test:live": "RUN_AZURE_LIVE_TESTS=1 vitest run test/azure.live.test.ts",
+    "test:watch": "vitest",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "verify": "pnpm format:check && pnpm lint && pnpm type-check && pnpm test && pnpm build",
+    "version-packages": "changeset version"
+  },
+  "dependencies": {
+    "@ai-sdk/harness": "1.0.36",
+    "@ai-sdk/provider-utils": "5.0.11",
+    "@azure/containerapps-sandbox": "1.0.0-beta.1",
+    "@azure/identity": "^4.13.1"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.31.1",
+    "@types/node": "^22.19.19",
+    "oxfmt": "^0.59.0",
+    "oxlint": "^1.74.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.34.3"
+}
