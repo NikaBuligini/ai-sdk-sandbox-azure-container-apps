@@ -7,11 +7,7 @@ import type {
   Sandbox,
   SandboxState,
 } from '@azure/containerapps-sandbox';
-import {
-  AZURE_CONTAINER_APPS_PROVIDER_ID,
-  SESSION_NAME_PREFIX,
-  SNAPSHOT_NAME_PREFIX,
-} from './constants.js';
+import { AZURE_CONTAINER_APPS_PROVIDER_ID, SESSION_NAME_PREFIX } from './constants.js';
 import {
   diagnosticError,
   emitDiagnostic,
@@ -34,8 +30,7 @@ const DEFAULT_POLLING_INTERVAL_MS = 1000;
 const DEFAULT_PROCESS_POLLING_INTERVAL_MS = 500;
 const DEFAULT_RESUME_TIMEOUT_MS = 60_000;
 const DEFAULT_SNAPSHOT_RESTORE_TIMEOUT_MS = 60_000;
-const SNAPSHOT_FORMAT_VERSION = 3;
-const LEGACY_SNAPSHOT_FORMAT_VERSION = 2;
+const SNAPSHOT_FORMAT_VERSION = 1;
 const CREATION_ATTEMPT_LABEL = 'ai-sdk.creation-attempt';
 
 export type AzureContainerAppsSandboxSource =
@@ -321,21 +316,6 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
         : { beforeFirstCreateIdentity: this.settings.beforeFirstCreateIdentity }),
     };
     const name = snapshotCacheName(namespace, cacheIdentity);
-    const legacyName =
-      this.settings.beforeFirstCreate == null && snapshotSettings?.namespaceRetentionCount == null
-        ? resourceName(
-            SNAPSHOT_NAME_PREFIX,
-            [
-              namespace,
-              identity,
-              stableHash({
-                source,
-                sandbox: this.settings.sandbox,
-                format: LEGACY_SNAPSHOT_FORMAT_VERSION,
-              }),
-            ].join(':'),
-          )
-        : undefined;
     const existing = this.snapshotOperations.get(name);
 
     if (existing != null && !existing.abortController.signal.aborted) {
@@ -346,7 +326,6 @@ export class AzureContainerAppsSandboxProvider implements HarnessV1SandboxProvid
     const promise = getOrCreateSnapshot({
       client: this.client,
       name,
-      ...(legacyName == null ? {} : { legacyName }),
       ...(this.settings.snapshotNamespace == null
         ? {}
         : { namespace: this.settings.snapshotNamespace }),

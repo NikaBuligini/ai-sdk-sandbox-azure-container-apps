@@ -87,21 +87,15 @@ afterEach(() => {
 
 describe('getOrCreateSnapshot', () => {
   describe('cache reuse and default retention', () => {
-    it.each([
-      ['current', undefined, 'current-name'],
-      ['legacy', 'legacy-name', 'legacy-name'],
-    ])('reuses a %s cache name', async (_kind, legacyName, cachedName) => {
-      const current = snapshot('snapshot-current', cachedName);
+    it('reuses a matching cache name', async () => {
+      const current = snapshot('snapshot-current', 'current-name');
       const client = {
         listSnapshots: vi.fn(async () => [current]),
         deleteSnapshot: vi.fn(async () => undefined),
         createSandbox: vi.fn(),
       };
 
-      const result = await getSnapshot(client, {
-        name: 'current-name',
-        ...(legacyName == null ? {} : { legacyName }),
-      });
+      const result = await getSnapshot(client, { name: 'current-name' });
 
       expect(result).toBe(current);
       expect(client.createSandbox).not.toHaveBeenCalled();
@@ -135,20 +129,19 @@ describe('getOrCreateSnapshot', () => {
       expect(client.createSandbox).toHaveBeenCalledOnce();
     });
 
-    it('cleans a stale legacy snapshot after creating its v3 replacement', async () => {
-      const legacy = snapshot('snapshot-legacy', 'legacy-name', 8 * DAY);
+    it('cleans a stale snapshot after creating its replacement', async () => {
+      const stale = snapshot('snapshot-stale', 'identity-name', 8 * DAY);
       const { client, created } = sourceCreationClient(async () => undefined);
-      client.listSnapshots.mockResolvedValueOnce([legacy]).mockResolvedValueOnce([created, legacy]);
+      client.listSnapshots.mockResolvedValueOnce([stale]).mockResolvedValueOnce([created, stale]);
 
       await expect(
         getSnapshot(client, {
-          legacyName: 'legacy-name',
           settings: { retentionCount: 1 },
         }),
       ).resolves.toBe(created);
       expect(client.createSandbox).toHaveBeenCalledOnce();
       expect(client.deleteSnapshot).toHaveBeenCalledOnce();
-      expect(client.deleteSnapshot).toHaveBeenCalledWith('snapshot-legacy');
+      expect(client.deleteSnapshot).toHaveBeenCalledWith('snapshot-stale');
     });
   });
 
@@ -179,11 +172,11 @@ describe('getOrCreateSnapshot', () => {
       expect(client.deleteSnapshot.mock.calls).toEqual([['identity-c'], ['identity-d']]);
     });
 
-    it('isolates exact namespaces from similar, hash-containing, malformed, and legacy names', async () => {
+    it('isolates exact namespaces from similar, hash-containing, malformed, and unversioned names', async () => {
       const namespace = 'team';
       const selectedName = snapshotCacheName(namespace, 'selected');
       const oldName = snapshotCacheName(namespace, 'old');
-      expect(selectedName).toMatch(/^ai-sdk-harness-snapshot-v3-n[0-9a-f]{16}-k[0-9a-f]{16}$/);
+      expect(selectedName).toMatch(/^ai-sdk-harness-snapshot-v1-n[0-9a-f]{16}-k[0-9a-f]{16}$/);
       expect(selectedName.length).toBeLessThanOrEqual(63);
       const namespaceHash = /-n([0-9a-f]{16})-/.exec(selectedName)?.[1];
       expect(namespaceHash).toBeDefined();
@@ -200,11 +193,11 @@ describe('getOrCreateSnapshot', () => {
         snapshot('valid-name-with-suffix', `${oldName}#duplicate`, 50 * MINUTE),
         snapshot(
           'malformed-current-name',
-          `ai-sdk-harness-snapshot-v3-n${namespaceHash}-knot-a-hash`,
+          `ai-sdk-harness-snapshot-v1-n${namespaceHash}-knot-a-hash`,
           60 * MINUTE,
         ),
         snapshot(
-          'legacy-name-containing-hash',
+          'unversioned-name-containing-hash',
           `ai-sdk-harness-snapshot-team#${namespaceHash}`,
           70 * MINUTE,
         ),

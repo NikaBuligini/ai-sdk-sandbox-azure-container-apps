@@ -13,7 +13,7 @@ import { raceWithAbort, resourceName, stableHash } from './internal/utils.js';
 const SNAPSHOT_SOURCE_PREFIX = 'ai-sdk-harness-snapshot-source';
 const CONCURRENT_CREATION_GRACE_MS = 5 * 60 * 1000;
 const DEFAULT_SOURCE_CLEANUP_TIMEOUT_MS = 60_000;
-const SNAPSHOT_NAME_PATTERN = /^ai-sdk-harness-snapshot-v3-n([0-9a-f]{16})-k([0-9a-f]{16})$/;
+const SNAPSHOT_NAME_PATTERN = /^ai-sdk-harness-snapshot-v1-n([0-9a-f]{16})-k([0-9a-f]{16})$/;
 
 export type AzureContainerAppsSnapshotSettings = {
   /** Maximum age of a reusable snapshot. Defaults to seven days. */
@@ -38,13 +38,12 @@ export type AzureContainerAppsSnapshotSettings = {
 };
 
 export function snapshotCacheName(namespace: string, identity: unknown): string {
-  return `${SNAPSHOT_NAME_PREFIX}-v3-n${stableHash(namespace)}-k${stableHash(identity)}`;
+  return `${SNAPSHOT_NAME_PREFIX}-v1-n${stableHash(namespace)}-k${stableHash(identity)}`;
 }
 
 export async function getOrCreateSnapshot(input: {
   client: AzureContainerAppsClient;
   name: string;
-  legacyName?: string;
   namespace?: string;
   sourceRequest: CreateSandboxRequest;
   settings: AzureContainerAppsSnapshotSettings;
@@ -84,7 +83,7 @@ export async function getOrCreateSnapshot(input: {
   }
 
   let snapshots = await input.client.listSnapshots(input.abortSignal);
-  let matching = matchingSnapshots(snapshots, input.name, input.legacyName);
+  let matching = matchingSnapshots(snapshots, input.name);
   emitDiagnostic(input.diagnostics, 'snapshot.cache.lookup', {
     cacheName: input.name,
     matches: matching.map(({ id, status, createdAtUtc }) => ({ id, status, createdAtUtc })),
@@ -169,7 +168,7 @@ export async function getOrCreateSnapshot(input: {
 
   input.abortSignal?.throwIfAborted();
   snapshots = await input.client.listSnapshots(input.abortSignal);
-  matching = matchingSnapshots(snapshots, input.name, input.legacyName);
+  matching = matchingSnapshots(snapshots, input.name);
   const selected = matching.find(({ id }) => id === created.id) ?? created;
   await cleanupSnapshots(
     input,
@@ -183,13 +182,9 @@ export async function getOrCreateSnapshot(input: {
   return selected;
 }
 
-function matchingSnapshots(snapshots: Snapshot[], name: string, legacyName?: string): Snapshot[] {
+function matchingSnapshots(snapshots: Snapshot[], name: string): Snapshot[] {
   return snapshots
-    .filter(
-      (snapshot) =>
-        snapshot.labels.name === name ||
-        (legacyName != null && snapshot.labels.name === legacyName),
-    )
+    .filter((snapshot) => snapshot.labels.name === name)
     .sort((left, right) => timestamp(right.createdAtUtc) - timestamp(left.createdAtUtc));
 }
 

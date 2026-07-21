@@ -246,7 +246,7 @@ const sandboxProvider = createAzureContainerAppsSandbox({
 
 const session = await sandboxProvider.createSession({
   sessionId: 'job-42',
-  identity: 'node-tools-v2',
+  identity: 'node-tools-v1',
   onFirstCreate: async (sandbox, { abortSignal }) => {
     await sandbox.run({
       command: './scripts/prepare-agent.sh',
@@ -262,7 +262,7 @@ The provider hook runs only when Harness `onFirstCreate` is present and actually
 
 Snapshot identity includes `snapshotNamespace`, Harness `identity`, source, native `sandbox` settings, an internal format version, and `beforeFirstCreateIdentity` when configured. Callback source is never used, so bump `identity` when Harness bootstrap inputs change and bump `beforeFirstCreateIdentity` whenever provider hook commands, dependencies, versions, or behavior change.
 
-New snapshots use versioned, unambiguous names. Exact compatible legacy names can still be reused safely when provider hooks and namespace retention are not active.
+Snapshots use versioned, unambiguous names beginning with `ai-sdk-harness-snapshot-v1-`.
 
 `snapshots.retentionCount` continues to apply per identity. Set `snapshots.namespaceRetentionCount` with an explicit `snapshotNamespace` to cap snapshots across identities in that namespace; the selected snapshot and snapshots five minutes old or younger are preserved.
 

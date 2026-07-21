@@ -11,7 +11,6 @@ import {
   type AzureContainerAppsSandboxSettings,
 } from '../src/index.js';
 import { resumeAction } from '../src/azureContainerAppsSandbox.js';
-import { resourceName, stableHash } from '../src/internal/utils.js';
 import { snapshotCacheName } from '../src/snapshotCache.js';
 
 type BeforeFirstCreateHook = (
@@ -495,7 +494,7 @@ describe('AzureContainerAppsSandboxProvider', () => {
         identity: 'harness-v1',
         source: { type: 'public-disk', name: 'node-24' },
         sandbox: undefined,
-        format: 3,
+        format: 1,
         beforeFirstCreateIdentity,
       });
     const snapshots: Snapshot[] = [
@@ -506,8 +505,8 @@ describe('AzureContainerAppsSandboxProvider', () => {
         createdAtUtc: new Date().toISOString(),
       },
       {
-        id: 'snapshot-provider-v2',
-        labels: { name: nameFor('provider-v2') },
+        id: 'snapshot-provider-changed',
+        labels: { name: nameFor('provider-changed') },
         status: 'Ready',
         createdAtUtc: new Date().toISOString(),
       },
@@ -535,7 +534,7 @@ describe('AzureContainerAppsSandboxProvider', () => {
     for (const [beforeFirstCreate, beforeFirstCreateIdentity] of [
       [firstCallback, 'provider-v1'],
       [differentCallbackSource, 'provider-v1'],
-      [differentCallbackSource, 'provider-v2'],
+      [differentCallbackSource, 'provider-changed'],
     ] as const) {
       const provider = createAzureContainerAppsSandbox({
         client,
@@ -551,7 +550,7 @@ describe('AzureContainerAppsSandboxProvider', () => {
     expect(beginCreate.mock.calls.map(([request]) => request.sourcesRef?.snapshot?.id)).toEqual([
       'snapshot-provider-v1',
       'snapshot-provider-v1',
-      'snapshot-provider-v2',
+      'snapshot-provider-changed',
     ]);
     expect(firstCallback).not.toHaveBeenCalled();
     expect(differentCallbackSource).not.toHaveBeenCalled();
@@ -601,14 +600,13 @@ describe('AzureContainerAppsSandboxProvider', () => {
       autoSuspend: { enabled: true, interval: 600, mode: 'Memory' as const },
       autoDelete: { enabled: true, deleteIntervalSeconds: 1800 },
     };
-    const snapshotName = resourceName(
-      'ai-sdk-harness-snapshot',
-      `default:identity-1:${stableHash({
-        source: { type: 'public-disk', name: 'node-24' },
-        sandbox: { lifecycle },
-        format: 2,
-      })}`,
-    );
+    const snapshotName = snapshotCacheName('default', {
+      namespace: 'default',
+      identity: 'identity-1',
+      source: { type: 'public-disk', name: 'node-24' },
+      sandbox: { lifecycle },
+      format: 1,
+    });
     const restoreError = Object.assign(new Error('Unexpected status code: 400'), {
       statusCode: 400,
       details: { error: undefined },
@@ -680,14 +678,13 @@ describe('AzureContainerAppsSandboxProvider', () => {
   it('does not retry a terminal snapshot restore validation error', async () => {
     const orphan = sandbox({ id: 'orphan-restore' });
     const diagnostics = vi.fn();
-    const snapshotName = resourceName(
-      'ai-sdk-harness-snapshot',
-      `default:identity-1:${stableHash({
-        source: { type: 'public-disk', name: 'node-24' },
-        sandbox: undefined,
-        format: 2,
-      })}`,
-    );
+    const snapshotName = snapshotCacheName('default', {
+      namespace: 'default',
+      identity: 'identity-1',
+      source: { type: 'public-disk', name: 'node-24' },
+      sandbox: undefined,
+      format: 1,
+    });
     const beginDelete = vi.fn(() => ({ pollUntilDone: async () => undefined }));
     const restoreError = Object.assign(new Error('invalid snapshot restore'), {
       statusCode: 400,
